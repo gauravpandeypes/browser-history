@@ -4,18 +4,24 @@ This module defines the generic base class and the functionaliity.
 All browsers from :py:mod:`browser_history.browsers` inherit this class.
 """
 import csv
+import datetime
 import json
-from io import StringIO
-from pathlib import Path
-from urllib.parse import urlparse
-from collections import defaultdict
+import os
+import shutil
 import sqlite3
 import tempfile
-import shutil
 import typing
-import datetime
-import os
+from collections import defaultdict
+from functools import partial
+from io import StringIO
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Tuple, Union
+from urllib.parse import urlparse
+
 import browser_history.utils as utils
+
+HistoryVar = List[Tuple[datetime.datetime, str]]
+BookmarkVar = List[Tuple[datetime.datetime, str, str, str]]
 
 
 class Browser:
@@ -249,24 +255,25 @@ class Outputs:
     A generic class to encapsulate history and bookmark outputs and to
     easily convert them to JSON, CSV or other formats.
 
-    * **histories**: List of tuples of Timestamp & URL
-        :type histories: list(tuple(:py:class:`datetime.datetime`, str))
-    * **bookmarks**: List of tuples of Timestamp , URL , Title , Folder
-        :type bookmarks: list(tuple(:py:class:`datetime.datetime`, str, str, str))
-    * **fetch_type**: string argument to select history output or bookmarks output
-        :type fetch_type: str
-    * **field_map**: Dictionary which maps fetch_type to the
-        respective variables and formatting fields
-    * **format_map**: Dictionary which maps output formats to their respective functions
-
+    :param fetch_type: string argument to select history output or bookmarks output
     """
 
+    # type hint for histories and bookmarks have to be manually written for docs
+    # instead of using HistoryVar and BookmarkVar respectively
+    histories: List[Tuple[datetime.datetime, str]]  #: List of tuples of Timestamp & URL
+    bookmarks: List[Tuple[datetime.datetime, str, str, str]]
+    """List of tuples of Timestamp, URL, Title, Folder."""
+
+    field_map: Dict[str, Dict[str, Any]]
+    """Dictionary which maps fetch_type to the respective variables and formatting fields."""
+
+    format_map: Dict[str, Callable]
+    """Dictionary which maps output formats to their respective functions."""
+
     def __init__(self, fetch_type):
+        self.fetch_type = fetch_type
         self.histories = []
         self.bookmarks = []
-
-        self.fetch_type = fetch_type
-
         self.field_map = {
             "history": {"var": self.histories, "fields": ("Timestamp", "URL")},
             "bookmarks": {
@@ -274,37 +281,45 @@ class Outputs:
                 "fields": ("Timestamp", "URL", "Title", "Folder"),
             },
         }
-
         self.format_map = {
             "csv": self.to_csv,
             "json": self.to_json,
-            "jsonl": lambda: self.to_json(json_lines=True),
+            "jsonl": partial(self.to_json, json_lines=True),
         }
 
-    def sort_domain(self):
+    def sort_domain(self) -> Union[HistoryVar, BookmarkVar]:
         """
         Returns the history/bookamarks sorted according to the domain-name.
 
-        :rtype: dict()
-                :type dict.key: str
-                :type dict.value: list(tuple(:py:class:`datetime.datetime`, str))
-                or
-                dict()
-                :type dict.key: str
-                :type dict.value: list(tuple(:py:class:`datetime.datetime`, str, str, str))
+        Examples:
+
+        >>> from datetime import datetime
+        ... from browser_history import generic
+        ... entries = [
+        ...     [datetime(2020, 1, 1), 'https://google.com'],
+        ...     [datetime(2020, 1, 1), 'https://google.com/imghp?hl=EN'],
+        ...     [datetime(2020, 1, 1), 'https://example.com'],
+        ... ]
+        ... obj = generic.Outputs('history')
+        ... obj.histories = entries
+        ... obj.sort_domain()
+        defaultdict(<class 'list'>, {
+            'example.com': [[datetime.datetime(2020, 1, 1, 0, 0), 'https://example.com']],
+            'google.com': [
+                 [datetime.datetime(2020, 1, 1, 0, 0), 'https://google.com'],
+                 [datetime.datetime(2020, 1, 1, 0, 0), 'https://google.com/imghp?hl=EN']]
+         })
         """
         domain_histories = defaultdict(list)
         for entry in self.field_map[self.fetch_type]["var"]:
             domain_histories[urlparse(entry[1]).netloc].append(entry)
         return domain_histories
 
-    def formatted(self, output_format="csv"):
+    def formatted(self, output_format: str = "csv") -> str:
         """
         Returns history or bookmarks as a :py:class:`str` formatted  as ``output_format``
 
         :param output_format: One the formats in `csv`, `json`, `jsonl`
-        :return: A string representing the outputs in specified format
-        :rtype: :py:class:`str` object
         """
         # convert to lower case since the formats tuple is enforced in lowercase
         output_format = output_format.lower()
@@ -318,13 +333,28 @@ class Outputs:
             {self.format_map.keys()}"
         )
 
-    def to_csv(self):
+    def to_csv(self) -> str:
         """
         Return history or bookmarks formatted as a comma separated string with the first row
         having the fields names
 
         :return: string with the output in CSV format
-        :rtype: :py:class:`str`
+
+        Examples:
+
+        >>> from datetime import datetime
+        ... from browser_history import generic
+        ... entries = [
+        ...     [datetime(2020, 1, 1), 'https://google.com'],
+        ...     [datetime(2020, 1, 1), 'https://example.com'],
+        ... ]
+        ... obj = generic.Outputs('history')
+        ... obj.histories = entries
+        ... print(obj.to_csv())
+        Timestamp,URL
+        2020-01-01 00:00:00,https://google.com
+        2020-01-01 00:00:00,https://example.com
+
         """
         # we will use csv module and let it do all the heavy lifting such as special character
         # escaping and correct line termination escape sequences
@@ -337,15 +367,41 @@ class Outputs:
                 writer.writerow(row)
             return output.getvalue()
 
-    def to_json(self, json_lines=False):
+    def to_json(self, json_lines: bool = False) -> str:
         """
         Return history or bookmarks formatted as a JSON or JSON Lines format
-        names
+        names. If ``json_lines`` flag is `True` convert to JSON Lines format,
+        otherwise convert it to Plain JSON format.
 
-        :param json_lines: (optional) flag to specify if the json_string should be JSON Lines.
-           Default is False.
+        :param json_lines: flag to specify if the json_string should be JSON Lines.
         :return: string with the output in JSON/JSONL format
-        :return: :py:class:`str`
+
+        Examples:
+
+        >>> from datetime import datetime
+        ... from browser_history import generic
+        ... entries = [
+        ...     [datetime(2020, 1, 1), 'https://google.com'],
+        ...     [datetime(2020, 1, 1), 'https://example.com'],
+        ... ]
+        ... obj = generic.Outputs()
+        ... obj.entries = entries
+        ... print(obj.to_json(True))
+        {"Timestamp": "2020-01-01T00:00:00", "URL": "https://google.com"}
+        {"Timestamp": "2020-01-01T00:00:00", "URL": "https://example.com"}
+        >>> print(obj.to_json())
+        {
+            "history": [
+                {
+                    "Timestamp": "2020-01-01T00:00:00",
+                    "URL": "https://google.com"
+                },
+                {
+                    "Timestamp": "2020-01-01T00:00:00",
+                    "URL": "https://example.com"
+                }
+            ]
+        }
         """
         # custom json encoder for datetime objects
         class DateTimeEncoder(json.JSONEncoder):
@@ -365,8 +421,6 @@ class Outputs:
                 json_record[field] = value
             lines.append(json_record)
 
-        # if json_lines flag is true convert to JSON Lines format,
-        # otherwise convert it to Plain JSON format
         if json_lines:
             json_string = "\n".join(
                 [json.dumps(line, cls=DateTimeEncoder) for line in lines]
